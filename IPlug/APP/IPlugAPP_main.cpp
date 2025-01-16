@@ -60,8 +60,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdPa
 
     static UINT(WINAPI *__SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 
-    double scale = 1.;
-
     if (!__SetProcessDpiAwarenessContext)
     {
       HINSTANCE h = LoadLibrary("user32.dll");
@@ -76,7 +74,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdPa
 
     CreateDialog(gHINSTANCE, MAKEINTRESOURCE(IDD_DIALOG_MAIN), GetDesktopWindow(), IPlugAPPHost::MainDlgProc);
 
-#ifndef _DEBUG
+#if !defined _DEBUG || defined NO_IGRAPHICS
     HMENU menu = GetMenu(gHWND);
     RemoveMenu(menu, 1, MF_BYPOSITION);
     DrawMenuBar(gHWND);
@@ -157,7 +155,7 @@ int main(int argc, char *argv[])
   //if invoked with an argument registerauv3 use plug-in kit to explicitly register auv3 app extension (doesn't happen from debugger)
   if(strcmp(argv[2], "registerauv3"))
   {
-    WDL_String appexPath(argv[0]);
+    WDL_String appexPath;
     appexPath.SetFormatted(1024, "pluginkit -a %s%s%s.appex", argv[0], "/../../Plugins/", appexPath.get_filepart());
     if(system(appexPath.Get()) > -1)
       NSLog(@"Registered audiounit app extension\n");
@@ -227,7 +225,7 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
 
         DeleteMenu(menu, 1, MF_BYPOSITION); // delete file menu
       }
-#ifndef _DEBUG
+#if !defined _DEBUG || defined NO_IGRAPHICS
       if (menu)
       {
         HMENU sm = GetSubMenu(menu, 1);

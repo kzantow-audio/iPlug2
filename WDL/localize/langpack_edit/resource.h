@@ -5,6 +5,7 @@
 #define IDI_ICON1                       101
 #define IDD_DIALOG1                     102
 #define IDD_RENAME                      103
+#define IDR_MENU1                       103
 #define IDR_CONTEXTMENU                 104
 #define IDC_LIST                        1000
 #define IDC_FILTER                      1001
@@ -27,14 +28,25 @@
 #define IDC_COPY_TEMPLATE               1018
 #define ID_SCALING_ADD                  1019
 #define IDC_REMOVE_NONLOCALIZATION      1020
-#define ID_QUIT                         40000
+#define ID_COL_STATE                    2000
+#define ID_COL_ID                       2001
+#define ID_COL_TEMPLATE                 2003
+#define ID_COL_LOCALIZED                2004
+#define ID_COL_COMMONLOCALIZED          2005
+#define ID_SORTCOL_REVERSE              2019
+#define ID_SORTCOL_STATE                2020
+#define ID_SORTCOL_ID                   2021
+#define ID_SORTCOL_TEMPLATE             2023
+#define ID_SORTCOL_LOCALIZED            2024
+#define ID_SORTCOL_COMMONLOCALIZED      2025
 
+#define ID_QUIT                         40000
 
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
-#define _APS_NEXT_RESOURCE_VALUE        103
+#define _APS_NEXT_RESOURCE_VALUE        104
 #define _APS_NEXT_COMMAND_VALUE         40001
 #define _APS_NEXT_CONTROL_VALUE         1021
 #define _APS_NEXT_SYMED_VALUE           101

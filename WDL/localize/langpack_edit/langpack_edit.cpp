@@ -35,9 +35,72 @@
 
 #include "../../localize/localize.h"
 #include "../../lineparse.h"
+
+#define WDL_HASSTRINGS_REWUTF8_HOOK(str, base) \
+ if ((str) > (base)) switch ((str)[0]) { \
+   case 'r': case 'n': case 't': case '0': if ((str)[-1] == '\\') (str)--; break; \
+   case 'd': case 's': case 'f': case 'g': case 'c': case 'u': if ((str)[-1] == '%') (str)--; break; \
+ }
 #include "../../has_strings.h"
 
 #include "resource.h"
+
+
+#ifndef HDF_SORTUP
+#define HDF_SORTUP 0x0400
+#endif
+#ifndef HDF_SORTDOWN
+#define HDF_SORTDOWN 0x0200
+#endif
+
+void ListView_SetHeaderSortArrow(HWND hlist, int col, int dir)
+{
+  HWND hhdr=ListView_GetHeader(hlist);
+  if (!hhdr) return;
+  for (int i=0; i < Header_GetItemCount(hhdr); ++i)
+  {
+    HDITEM hi = { HDI_FORMAT, 0, };
+    Header_GetItem(hhdr, i, &hi);
+    hi.fmt &= ~(HDF_SORTUP|HDF_SORTDOWN);
+    if (i == col) hi.fmt |= (dir > 0 ? HDF_SORTUP : HDF_SORTDOWN);
+    Header_SetItem(hhdr, i, &hi);
+  }
+}
+
+
+template<class A, class B> static void Restore_ListSelState(HWND hlist, const WDL_TypedBuf<A> *order, const B *st)
+{
+#ifdef __APPLE__
+   SendMessage(hlist,WM_SETREDRAW,FALSE,0);
+#endif
+  int x;
+  const int n = order->GetSize();
+  int frow = -1;
+  for (x = 0; x < n; x ++)
+  {
+    bool sel = st->Get(order->Get()[x]);
+    if (frow < 0 && sel) frow = x;
+    ListView_SetItemState(hlist, x, sel ? LVIS_SELECTED : 0, LVIS_SELECTED);
+  }
+  if (frow >= 0)
+    ListView_EnsureVisible(hlist, frow, FALSE);
+#ifdef __APPLE__
+   SendMessage(hlist,WM_SETREDRAW,TRUE,0);
+#endif
+}
+
+template<class A, class B> static void Save_ListSelState(HWND hlist, const WDL_TypedBuf<A> *order, B *st)
+{
+  int x;
+  const int n = order->GetSize();
+  for (x = 0; x < n; x ++)
+  {
+    if (ListView_GetItemState(hlist,x,LVIS_SELECTED)) st->AddUnsorted(order->Get()[x], true);
+  }
+  st->Resort();
+}
+
+
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 bool g_quit;
@@ -47,8 +110,9 @@ HINSTANCE g_hInstance;
 WDL_FastString g_ini_file;
 
 enum {
-  COL_STATE=0,
+  COL_STATE=0, // if we edit these need to edit the IDs of ID_COL_* in resource.h
   COL_ID,
+  COL_ROW_IDX,
   COL_TEMPLATE,
   COL_LOCALIZED,
   COL_COMMON_LOCALIZED,
@@ -72,13 +136,18 @@ struct pack_rec {
 };
 
 struct editor_instance {
-  editor_instance() : m_recs(false, pack_rec::freeptrs), m_hwnd(NULL), m_dirty(false) { }
+  editor_instance() : m_recs(true, pack_rec::freeptrs),
+                      m_column_no_searchflags(0), m_sort_col(COL_ID), m_sort_rev(false),
+                      m_hwnd(NULL), m_dirty(false) { }
   ~editor_instance() { }
 
   WDL_FastString m_pack_fn;
 
   WDL_StringKeyedArray2<pack_rec> m_recs;
   WDL_TypedBuf<int> m_display_order;
+  int m_column_no_searchflags; // bits for exclude from search per column
+  int m_sort_col;
+  bool m_sort_rev;
 
   HWND m_hwnd;
   bool m_dirty;
@@ -89,7 +158,9 @@ struct editor_instance {
   void save_file(const char *filename);
 
   void cull_recs();
-  void refresh_list(bool refilter=true);
+  void refresh_list();
+  void sort_display_order();
+  void on_sort_change();
 
   const char *get_rec_value(const pack_rec *r, const char *k, int w) const
   {
@@ -151,6 +222,8 @@ struct editor_instance {
   }
 
   bool edit_row(int rec_idx, int other_action=IDC_LOCALIZED_STRING);
+  bool on_key(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+  void item_context_menu();
 
   void set_dirty()
   {
@@ -184,7 +257,7 @@ struct editor_instance {
   }
 };
 
-static void del_array(WDL_AssocArray<WDL_UINT64, char *> *d) { delete d; }
+static void del_array(WDL_KeyedArray<WDL_UINT64, char *> *d) { delete d; }
 
 static void format_section_id(char *buf, size_t bufsz, const char *section, WDL_UINT64 id)
 {
@@ -216,6 +289,7 @@ void editor_instance::save_file(const char *filename)
   buf[0]=0;
   if (WDL_NORMALLY(m_hwnd))
     GetDlgItemText(m_hwnd,IDC_COMMENTS,buf,sizeof(buf));
+  WDL_remove_trailing_whitespace(buf);
   fprintf(fp,"%s\r\n",buf);
 
   char last_sec[1024];
@@ -231,18 +305,6 @@ void editor_instance::save_file(const char *filename)
     const char *id = parse_section_id(k,sec,sizeof(sec));
     if (WDL_NORMALLY(id))
     {
-      if (rec->common_idx>=0 && WDL_NORMALLY(stricmp(sec,"common")))
-      {
-        // optimize and don't write out duplicate strings which are already in [common]
-        const char *k2;
-        pack_rec *r2 = m_recs.EnumeratePtr(rec->common_idx,&k2);
-        if (WDL_NORMALLY(r2 && k2))
-        {
-          if (r2->pack_str && !strcmp(r2->pack_str,rec->pack_str))
-            continue;
-        }
-      }
-
       if (stricmp(last_sec,sec))
       {
         lstrcpyn_safe(last_sec,sec,sizeof(last_sec));
@@ -277,16 +339,16 @@ void editor_instance::load_file(const char *filename, bool is_template)
     }
   }
 
-  WDL_StringKeyedArray<char *> extra(false, WDL_StringKeyedArray<char>::freecharptr);
+  WDL_StringKeyedArray<char *> extra(true, WDL_StringKeyedArray<char>::freecharptr);
   if (*filename)
   {
-    WDL_StringKeyedArray< WDL_AssocArray<WDL_UINT64, char *> * > r(false,del_array);
+    WDL_StringKeyedArray< WDL_KeyedArray<WDL_UINT64, char *> * > r(false,del_array);
     WDL_LoadLanguagePackInternal(filename,&r,NULL, is_template, true, &extra);
 
     for (int si = 0; si < r.GetSize(); si ++)
     {
       const char *sec_name;
-      WDL_AssocArray<WDL_UINT64, char *> *sec = r.Enumerate(si,&sec_name);
+      WDL_KeyedArray<WDL_UINT64, char *> *sec = r.Enumerate(si,&sec_name);
       for (int i = 0; i < sec->GetSize(); i ++)
       {
         WDL_UINT64 id;
@@ -354,6 +416,8 @@ void editor_instance::load_file(const char *filename, bool is_template)
         if (fs.GetLength()) fs.Append("\r\n");
         fs.Append(p);
       }
+      if (fs.GetLength())
+        WDL_remove_trailing_whitespace((char *)fs.Get());
       SetDlgItemText(m_hwnd,IDC_COMMENTS,fs.Get());
     }
   }
@@ -369,74 +433,132 @@ void editor_instance::cull_recs()
   }
 }
 
-void editor_instance::refresh_list(bool refilter)
+void editor_instance::refresh_list()
 {
-  int *p, cnt;
-  if (refilter)
-  {
-    p = m_display_order.Resize(m_recs.GetSize());
-    cnt = 0;
-  }
-  else
-  {
-    p = m_display_order.Get();
-    cnt = m_display_order.GetSize();
-  }
+  HWND list = WDL_NORMALLY(m_hwnd) ? GetDlgItem(m_hwnd,IDC_LIST) : NULL;
+  WDL_IntKeyedArray<bool> selState;
+  if (list)
+    Save_ListSelState(list, &m_display_order, &selState);
 
-  if (m_recs.GetSize() && WDL_NORMALLY(p))
-  {
-    LineParser lp;
-    if (refilter && m_hwnd)
-    {
-      char filter[512];
-      GetDlgItemText(m_hwnd,IDC_FILTER,filter,sizeof(filter));
-      WDL_makeSearchFilter(filter, &lp);
-    }
-    const bool do_filt = lp.getnumtokens()>0;
-    for (int x = 0; x < m_recs.GetSize(); x ++)
-    {
-      const char *k = NULL;
-      pack_rec *r = m_recs.EnumeratePtr(x,&k);
-      if (WDL_NOT_NORMALLY(!r)) break;
+  m_display_order.Resize(0,false);
 
-      if (strnicmp(k,"common:",7))
-      {
-        const char *sid = parse_section_id(k,NULL,0);
-        if (WDL_NORMALLY(sid))
-        {
-          char tmp[256];
-          snprintf(tmp,sizeof(tmp),"common:%s",sid);
-          r->common_idx = m_recs.GetIdx(tmp);
-        }
-      }
-      else
-        r->common_idx = -1;
-
-      if (refilter)
-      {
-        const char *strs[COL_MAX];
-        int nc = 0;
-        if (do_filt)
-        {
-          for (int c =0; c < COL_MAX; c ++)
-          {
-            const char *v = get_rec_value(r,k,c);
-            if (v) strs[nc++] = v;
-          }
-        }
-
-        if (!do_filt || WDL_hasStringsEx2(strs,nc,&lp,NULL))
-          p[cnt++] = x;
-      }
-    }
-  }
-
-  m_display_order.Resize(cnt,false);
+  LineParser lp;
   if (m_hwnd)
   {
-    HWND list = GetDlgItem(m_hwnd,IDC_LIST);
-    ListView_SetItemCount(list,cnt);
-    ListView_RedrawItems(list,0,cnt);
+    char filter[512];
+    GetDlgItemText(m_hwnd,IDC_FILTER,filter,sizeof(filter));
+    WDL_makeSearchFilter(filter, &lp);
+  }
+  const bool do_filt = lp.getnumtokens()>0;
+  for (int x = 0; x < m_recs.GetSize(); x ++)
+  {
+    const char *k = NULL;
+    pack_rec *r = m_recs.EnumeratePtr(x,&k);
+    if (WDL_NOT_NORMALLY(!r)) break;
+
+    if (strnicmp(k,"common:",7))
+    {
+      const char *sid = parse_section_id(k,NULL,0);
+      if (WDL_NORMALLY(sid))
+      {
+        char tmp[256];
+        snprintf(tmp,sizeof(tmp),"common:%s",sid);
+        r->common_idx = m_recs.GetIdx(tmp);
+      }
+    }
+    else
+      r->common_idx = -1;
+
+    const char *strs[COL_MAX];
+    int nc = 0;
+    if (do_filt)
+    {
+      for (int c =0; c < COL_MAX; c ++)
+      {
+        if (m_column_no_searchflags & (1<<c)) continue;
+        const char *v = get_rec_value(r,k,c);
+        if (v) strs[nc++] = v;
+      }
+    }
+
+    if (!do_filt || WDL_hasStringsEx2(strs,nc,&lp))
+      m_display_order.Add(&x,1);
+  }
+
+  sort_display_order();
+
+  if (list)
+  {
+    ListView_SetItemCount(list, m_display_order.GetSize());
+    Restore_ListSelState(list, &m_display_order, &selState);
+    ListView_RedrawItems(list, 0, m_display_order.GetSize());
+  }
+}
+
+static editor_instance *sort_inst;
+static int sort_func(const void *a, const void *b)
+{
+  const int idx_a = *(const int *)a, idx_b = *(const int *)b;
+  int ret = idx_a < idx_b ? -1 : idx_a > idx_b ? 1 : 0;
+
+  const int col = sort_inst->m_sort_col;
+  switch (col)
+  {
+    case COL_STATE:
+    case COL_TEMPLATE:
+    case COL_LOCALIZED:
+    case COL_COMMON_LOCALIZED:
+    case COL_ID:
+      {
+        const char *ak, *bk;
+        const pack_rec *ar = sort_inst->m_recs.EnumeratePtr(idx_a,&ak);
+        const pack_rec *br = sort_inst->m_recs.EnumeratePtr(idx_b,&bk);
+        const char *av = ar ? sort_inst->get_rec_value(ar,ak,col) : NULL;
+        const char *bv = br ? sort_inst->get_rec_value(br,bk,col) : NULL;
+        if (av || bv)
+        {
+          if (av) while (*av == ' ') av++;
+          if (bv) while (*bv == ' ') bv++;
+          int diff = WDL_strcmp_logical_ex(av?av:"",bv?bv:"",0,WDL_STRCMP_LOGICAL_EX_FLAG_UTF8CONVERT);
+          if (diff) ret = diff;
+        }
+      }
+    break;
+  }
+  return sort_inst->m_sort_rev ? -ret : ret;
+}
+
+
+void editor_instance::on_sort_change()
+{
+  char tmp[64];
+  snprintf(tmp, sizeof(tmp), "%d", m_sort_col);
+  WritePrivateProfileString("LangPackEdit", "sortcol", tmp, g_ini_file.Get());
+  WritePrivateProfileString("LangPackEdit", "sortrev", m_sort_rev ? "1" : "0", g_ini_file.Get());
+
+  if (!m_hwnd) return;
+  HWND list = GetDlgItem(m_hwnd,IDC_LIST);
+
+  if (!list) return;
+  WDL_IntKeyedArray<bool> selState;
+  Save_ListSelState(list, &m_display_order, &selState);
+
+  sort_display_order();
+
+  ListView_SetHeaderSortArrow(list, m_sort_col, (m_sort_rev ? -1 : 1));
+  ListView_SetItemCount(list, m_display_order.GetSize());
+  Restore_ListSelState(list, &m_display_order, &selState);
+
+  ListView_RedrawItems(list, 0, m_display_order.GetSize());
+}
+
+void editor_instance::sort_display_order()
+{
+  if (m_display_order.GetSize() > 1)
+  {
+    sort_inst = this;
+    qsort(m_display_order.Get(), m_display_order.GetSize(), sizeof(m_display_order.Get()[0]), sort_func);
+    sort_inst = NULL;
   }
 }
 
@@ -472,6 +594,11 @@ WDL_DLGRET editorProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
               SetDlgItemText(hwndDlg,IDC_COMMON_STRING,r2->pack_str ? r2->pack_str : __LOCALIZE("(not yet localized)","langpackedit"));
               common_str = r2->pack_str;
             }
+          }
+          else if (!strnicmp(k,"common:",7))
+          {
+            ShowWindow(GetDlgItem(hwndDlg,IDC_COMMON_LABEL),SW_HIDE);
+            ShowWindow(GetDlgItem(hwndDlg,IDC_COMMON_STRING),SW_HIDE);
           }
           else
             SetDlgItemText(hwndDlg,IDC_COMMON_STRING,__LOCALIZE("(not in [common])","langpackedit"));
@@ -589,17 +716,78 @@ bool editor_instance::edit_row(int row, int other_action)
   void *p[2] = { this, (void *)(INT_PTR) rec_idx };
   if (DialogBoxParam(g_hInstance, MAKEINTRESOURCE(IDD_RENAME), m_hwnd, editorProc, (LPARAM)p))
   {
-    refresh_list(false);
+    refresh_list();
     set_dirty();
     return true;
   }
   return false;
 }
 
+
+bool editor_instance::on_key(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  if (!m_hwnd || (hwnd != m_hwnd && !IsChild(m_hwnd,hwnd)))
+    return false;
+
+#ifndef __APPLE__
+  if (msg == WM_KEYDOWN && (wParam=='S' || wParam == 'O' || wParam == 'T'))
+  {
+    bool shift = !!(GetAsyncKeyState(VK_SHIFT)&0x8000);
+    bool ctrl = !!(GetAsyncKeyState(VK_CONTROL)&0x8000);
+    if (!shift && ctrl)
+    {
+      bool alt = !!(GetAsyncKeyState(VK_MENU)&0x8000);
+      int cmd = 0;
+      if (wParam == 'S' && ctrl) cmd = alt ? IDC_PACK_SAVE_AS : IDC_PACK_SAVE;
+      else if (wParam == 'O') cmd = IDC_PACK_LOAD;
+      else if (wParam == 'T') cmd = IDC_TEMPLATE_LOAD;
+
+      if (cmd)
+      {
+        SendMessage(m_hwnd,WM_COMMAND,cmd,0);
+        return 1;
+      }
+    }
+  }
+#endif
+
+  HWND hlist = GetDlgItem(m_hwnd,IDC_LIST);
+  if (hwnd == hlist || IsChild(hlist,hwnd))
+  {
+    if (msg == WM_KEYDOWN) switch (wParam)
+    {
+      case VK_RETURN:
+        SendMessage(m_hwnd,WM_COMMAND,IDC_LOCALIZED_STRING,0);
+      return true;
+      break;
+#ifdef _WIN32
+      case VK_APPS:
+        item_context_menu();
+      return true;
+#endif
+      case VK_BACK:
+      case VK_DELETE:
+        SendMessage(m_hwnd,WM_COMMAND,IDC_REMOVE_LOCALIZATION,0);
+      return true;
+    }
+  }
+  return false;
+}
+
+void editor_instance::item_context_menu()
+{
+  HMENU menu = LoadMenu(g_hInstance, MAKEINTRESOURCE(IDR_CONTEXTMENU));
+  POINT p;
+  GetCursorPos(&p);
+  TrackPopupMenu(GetSubMenu(menu,0),0,p.x,p.y,0,m_hwnd,NULL);
+  DestroyMenu(menu);
+}
+
 const char *COL_DESCS[COL_MAX] = {
   // !WANT_LOCALIZE_STRINGS_BEGIN:langpackedit
   "State",
   "ID",
+  "Row",
   "Template",
   "Localized",
   "Common Localized",
@@ -609,6 +797,7 @@ const char *COL_DESCS[COL_MAX] = {
 int COL_SIZES[COL_MAX] = {
   120,
   120,
+  30,
   240,
   240,
   240,
@@ -634,18 +823,14 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
       g_editor.m_resize.init(hwndDlg);
       g_editor.m_resize.init_item(IDC_FILTER,0,0,1,0);
       g_editor.m_resize.init_item(IDC_TEMPLATE,0,0,1,0);
-      g_editor.m_resize.init_item(IDC_TEMPLATE_LOAD,1,0,1,0);
       g_editor.m_resize.init_item(IDC_PACK,0,0,1,0);
-      g_editor.m_resize.init_item(IDC_PACK_LOAD,1,0,1,0);
-      g_editor.m_resize.init_item(IDC_PACK_SAVE,1,0,1,0);
-      g_editor.m_resize.init_item(IDC_PACK_SAVE_AS,1,0,1,0);
       g_editor.m_resize.init_item(IDC_COMMENTS,0,0,1,0);
       g_editor.m_resize.init_item(IDC_LIST,0,0,1,1);
 
       {
         HWND hlist = GetDlgItem(hwndDlg, IDC_LIST);
 
-        int s=LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES;
+        int s=LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES|LVS_EX_HEADERDRAGDROP;
 #ifdef _WIN32
         s|=LVS_EX_DOUBLEBUFFER;
 #endif
@@ -655,11 +840,19 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         WDL_UTF8_HookListView(hlist);
         SendMessage(hlist,LVM_SETUNICODEFORMAT,1,0);
 #endif
+        int colorder[COL_MAX];
         for (int x = 0; x < COL_MAX; x ++)
         {
-          LVCOLUMN lvc = { LVCF_TEXT|LVCF_WIDTH, 0, COL_SIZES[x], (char*)__localizeFunc(COL_DESCS[x],"langpackedit",LOCALIZE_FLAG_NOCACHE) };
+          char buf[64];
+          sprintf(buf, "colwid_%d", x);
+          int colw=GetPrivateProfileInt("LangPackEdit", buf, COL_SIZES[x], g_ini_file.Get());
+          sprintf(buf, "colorder_%d", x);
+          colorder[x]=GetPrivateProfileInt("LangPackEdit", buf, x, g_ini_file.Get());
+
+          LVCOLUMN lvc = { LVCF_TEXT|LVCF_WIDTH, 0, colw, (char*)__localizeFunc(COL_DESCS[x],"langpackedit",LOCALIZE_FLAG_NOCACHE) };
           ListView_InsertColumn(hlist, x, &lvc);
         }
+        ListView_SetColumnOrderArray(hlist, COL_MAX, colorder);
       }
 
       {
@@ -669,11 +862,39 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         GetPrivateProfileString("LangPackEdit","lastpack","",buf,sizeof(buf),g_ini_file.Get());
         g_editor.load_file(buf,false);
+
+        g_editor.m_column_no_searchflags = GetPrivateProfileInt("LangPackEdit","nosearchcols",0,g_ini_file.Get());
+        g_editor.m_sort_col = GetPrivateProfileInt("LangPackEdit","sortcol",COL_ID,g_ini_file.Get());
+        g_editor.m_sort_rev = GetPrivateProfileInt("LangPackEdit","sortrev",0,g_ini_file.Get()) > 0;
+        ListView_SetHeaderSortArrow(GetDlgItem(hwndDlg,IDC_LIST), g_editor.m_sort_col, (g_editor.m_sort_rev ? -1 : 1));
         g_editor.m_pack_fn.Set(buf);
         g_editor.set_caption();
       }
     return 1;
     case WM_DESTROY:
+
+      {
+        HWND hlist = GetDlgItem(hwndDlg,IDC_LIST);
+        int colorder[COL_MAX];
+        for (int i=0; i < COL_MAX; ++i) colorder[i]=i;
+        ListView_GetColumnOrderArray(hlist, COL_MAX, colorder);
+
+        for (int i=0; i < COL_MAX; ++i)
+        {
+          int colw = ListView_GetColumnWidth(hlist, i);
+          char buf[256], buf2[256];
+          sprintf(buf2, "colwid_%d", i);
+          sprintf(buf, "%d", colw);
+          char* p = colw == (int)COL_SIZES[i] ? NULL : buf;
+          WritePrivateProfileString("LangPackEdit", buf2, p, g_ini_file.Get());
+
+          sprintf(buf2, "colorder_%d", i);
+          sprintf(buf, "%d", colorder[i]);
+          p = colorder[i] == i ? NULL : buf;
+          WritePrivateProfileString("LangPackEdit", buf2, p, g_ini_file.Get());
+        }
+      }
+
       g_editor.m_hwnd = NULL;
 #ifdef __APPLE__
       SWELL_PostQuitMessage(0);
@@ -767,6 +988,90 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
           }
         break;
+        case IDC_LOCALIZED_STRING:
+        case IDC_COMMON_STRING:
+        case ID_SCALING_ADD:
+        case IDC_COPY_TEMPLATE:
+        case IDC_REMOVE_LOCALIZATION:
+        case IDC_REMOVE_NONLOCALIZATION:
+          {
+            HWND list = GetDlgItem(hwndDlg,IDC_LIST);
+            int cnt = 0;
+            const int n = ListView_GetItemCount(list);
+            for (int x = 0; x < n; x ++)
+            {
+              if (ListView_GetItemState(list,x,LVIS_SELECTED) & LVIS_SELECTED)
+              {
+                if (g_editor.edit_row(x,(int)wParam)) cnt++;
+                if (wParam == ID_SCALING_ADD)
+                  ListView_SetItemState(list,x,0,LVIS_SELECTED);
+              }
+            }
+            if (cnt && wParam != IDC_LOCALIZED_STRING)
+            {
+              g_editor.refresh_list();
+              g_editor.set_dirty();
+            }
+            if (wParam == ID_SCALING_ADD)
+            {
+              const int nn = ListView_GetItemCount(list);
+              if (n < nn)
+              {
+                ListView_EnsureVisible(list,n,false);
+                for (int i = n; i < nn; i ++)
+                  ListView_SetItemState(list,i,LVIS_SELECTED,LVIS_SELECTED);
+              }
+            }
+          }
+        break;
+        case ID_COL_STATE:
+        case ID_COL_ID:
+        case ID_COL_TEMPLATE:
+        case ID_COL_LOCALIZED:
+        case ID_COL_COMMONLOCALIZED:
+          g_editor.m_column_no_searchflags ^= (1<<(LOWORD(wParam) - ID_COL_STATE));
+          {
+            char tmp[64];
+            snprintf(tmp,sizeof(tmp),"%d",g_editor.m_column_no_searchflags);
+            WritePrivateProfileString("LangPackEdit","nosearchcols",tmp,g_ini_file.Get());
+          }
+          SetTimer(hwndDlg,TIMER_FILTER,100,NULL);
+        break;
+        case ID_SORTCOL_STATE:
+        case ID_SORTCOL_ID:
+        case ID_SORTCOL_TEMPLATE:
+        case ID_SORTCOL_LOCALIZED:
+        case ID_SORTCOL_COMMONLOCALIZED:
+          g_editor.m_sort_rev = false;
+          g_editor.m_sort_col = LOWORD(wParam) - ID_SORTCOL_STATE;
+          g_editor.on_sort_change();
+        break;
+        case ID_SORTCOL_REVERSE:
+          g_editor.m_sort_rev = !g_editor.m_sort_rev;
+          g_editor.on_sort_change();
+        break;
+      }
+    break;
+    case WM_INITMENUPOPUP:
+      if (wParam)
+      {
+        HMENU menu = (HMENU) wParam;
+        static const unsigned short tab[]={
+          IDC_LOCALIZED_STRING,
+          IDC_COMMON_STRING,
+          ID_SCALING_ADD,
+          IDC_COPY_TEMPLATE,
+          IDC_REMOVE_LOCALIZATION,
+          IDC_REMOVE_NONLOCALIZATION,
+        };
+        bool en = ListView_GetSelectedCount(GetDlgItem(hwndDlg,IDC_LIST))>0;
+        for (size_t x = 0; x < sizeof(tab)/sizeof(tab[0]); x ++)
+          EnableMenuItem(menu,tab[x],MF_BYCOMMAND|(en ? 0 : MF_GRAYED));
+        for (int x = 0; x < COL_MAX; x ++)
+          CheckMenuItem(menu,ID_COL_STATE+x, MF_BYCOMMAND | ((g_editor.m_column_no_searchflags&(1<<x)) ? MF_UNCHECKED:MF_CHECKED));
+        for (int x = 0; x < COL_MAX; x ++)
+          CheckMenuItem(menu,ID_SORTCOL_STATE+x, MF_BYCOMMAND | ((g_editor.m_sort_col == x) ? MF_CHECKED:MF_UNCHECKED));
+        CheckMenuItem(menu,ID_SORTCOL_REVERSE, MF_BYCOMMAND | (g_editor.m_sort_rev ? MF_CHECKED:MF_UNCHECKED));
       }
     break;
     case WM_NOTIFY:
@@ -780,44 +1085,23 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
           case NM_RCLICK:
             if (ListView_GetSelectedCount(lv->hdr.hwndFrom)>0)
             {
-              HMENU menu = LoadMenu(g_hInstance, MAKEINTRESOURCE(IDR_CONTEXTMENU));
-
-              POINT p;
-              GetCursorPos(&p);
-              int ret = TrackPopupMenu(menu,TPM_NONOTIFY|TPM_RETURNCMD,p.x,p.y,0,hwndDlg,NULL);
-              DestroyMenu(menu);
-
-              if (ret)
+              g_editor.item_context_menu();
+            }
+          return 0;
+          case LVN_COLUMNCLICK:
+            {
+              int col = lv->iSubItem;
+              if (col == COL_ROW_IDX) col = COL_ID;
+              if (g_editor.m_sort_col == col)
               {
-                int cnt = 0;
-                HWND list = lv->hdr.hwndFrom;
-                const int n = ListView_GetItemCount(list);
-                for (int x = 0; x < n; x ++)
-                {
-                  if (ListView_GetItemState(list,x,LVIS_SELECTED) & LVIS_SELECTED)
-                  {
-                    if (g_editor.edit_row(x,ret)) cnt++;
-                    if (ret == ID_SCALING_ADD)
-                      ListView_SetItemState(list,x,0,LVIS_SELECTED);
-                  }
-                }
-                if (cnt && ret != IDC_LOCALIZED_STRING)
-                {
-                  g_editor.refresh_list(false);
-                  g_editor.set_dirty();
-                }
-                if (ret == ID_SCALING_ADD)
-                {
-                  const int nn = ListView_GetItemCount(list);
-                  if (n < nn)
-                  {
-                    ListView_EnsureVisible(list,n,false);
-                    for (int i = n; i < nn; i ++)
-                      ListView_SetItemState(list,i,LVIS_SELECTED,LVIS_SELECTED);
-                  }
-                }
+                g_editor.m_sort_rev = !g_editor.m_sort_rev;
               }
-
+              else
+              {
+                g_editor.m_sort_rev = false;
+                g_editor.m_sort_col = col;
+              }
+              g_editor.on_sort_change();
             }
           return 0;
           case LVN_GETDISPINFO:
@@ -828,7 +1112,10 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
             NMLVDISPINFO *lpdi = (NMLVDISPINFO*) lParam;
             if (lpdi->item.mask & LVIF_TEXT)
             {
-              lpdi->item.pszText = (char*) g_editor.get_row_value(lpdi->item.iItem, lpdi->item.iSubItem);
+              if (lpdi->item.iSubItem == COL_ROW_IDX)
+                snprintf(lpdi->item.pszText,lpdi->item.cchTextMax,"%d",lpdi->item.iItem+1);
+              else
+                lpdi->item.pszText = (char*) g_editor.get_row_value(lpdi->item.iItem, lpdi->item.iSubItem);
 #ifdef _WIN32
               if (lv->hdr.code == LVN_GETDISPINFOW)
                 WDL_UTF8_ListViewConvertDispInfoToW(lpdi);
@@ -861,12 +1148,48 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
         WDL_remove_filepart(buf);
         lstrcatn(buf,WDL_DIRCHAR_STR "LangPackEdit.LangPack",sizeof(buf));
 
+#ifdef _DEBUG
         extern bool g_debug_langpack_has_loaded;
         g_debug_langpack_has_loaded=true;
+#endif
         WDL_LoadLanguagePack(buf,NULL);
 
         HWND h=CreateDialog(NULL,MAKEINTRESOURCE(IDD_DIALOG1),NULL,mainProc);
         ShowWindow(h,SW_SHOW);
+
+#ifndef _WIN32
+      {
+        HMENU menu = LoadMenu(NULL,MAKEINTRESOURCE(IDR_MENU1));
+#ifdef __APPLE__
+        {
+          HMENU sm=GetSubMenu(menu,0);
+          DeleteMenu(sm,ID_QUIT,MF_BYCOMMAND); // remove QUIT from our file menu, since it is in the system menu on OSX
+
+          // remove any trailing separators
+          int a= GetMenuItemCount(sm);
+          while (a > 0 && GetMenuItemID(sm,a-1)==0) DeleteMenu(sm,--a,MF_BYPOSITION);
+        }
+
+        extern HMENU SWELL_app_stocksysmenu;
+        if (SWELL_app_stocksysmenu) // insert the stock system menu
+        {
+          HMENU nm=SWELL_DuplicateMenu(SWELL_app_stocksysmenu);
+          if (nm)
+          {
+            MENUITEMINFO mi={sizeof(mi),MIIM_STATE|MIIM_SUBMENU|MIIM_TYPE,MFT_STRING,0,0,nm,NULL,NULL,0,(char*)"LangPackEdit"};
+            InsertMenuItem(menu,0,TRUE,&mi);
+          }
+        }
+        SetMenuItemModifier(menu,IDC_TEMPLATE_LOAD,MF_BYCOMMAND,'T',FCONTROL);
+        SetMenuItemModifier(menu,IDC_PACK_LOAD,MF_BYCOMMAND,'O',FCONTROL);
+        SetMenuItemModifier(menu,IDC_PACK_SAVE,MF_BYCOMMAND,'S',FCONTROL);
+        SetMenuItemModifier(menu,IDC_PACK_SAVE_AS,MF_BYCOMMAND,'S',FCONTROL|FALT);
+#endif
+
+        SetMenu(h,menu);
+      }
+#endif
+
       }
     break;
     case SWELLAPP_DESTROY:
@@ -877,6 +1200,28 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
     case SWELLAPP_ONCOMMAND:
       if (g_editor.m_hwnd)
         SendMessage(g_editor.m_hwnd,WM_COMMAND,parm1,0);
+    return 0;
+    case SWELLAPP_PROCESSMESSAGE:
+     if (parm1)
+     {
+       const MSG *m = (MSG *)parm1;
+       if (m->message == WM_KEYDOWN && m->hwnd)
+       {
+#ifndef __APPLE__
+         if (m->wParam == 'Q' && 
+             (GetAsyncKeyState(VK_CONTROL)&0x8000) &&
+             !(GetAsyncKeyState(VK_SHIFT)&0x8000) &&
+             !(GetAsyncKeyState(VK_MENU)&0x8000))
+         {
+           if (g_editor.m_hwnd)
+             SendMessage(g_editor.m_hwnd,WM_COMMAND,ID_QUIT,0);
+           return 1;
+         }
+#endif
+         if (g_editor.on_key(m->hwnd, m->message, m->wParam, m->lParam))
+           return 1;
+       }
+     }
     return 0;
   }
   return 0;
